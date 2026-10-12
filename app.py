@@ -1,8 +1,11 @@
 """A small dictionary-backed web app using only Python's standard library."""
 
 import argparse
+from copy import deepcopy
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import re
 from urllib.parse import parse_qs, quote, urlsplit
 
 
@@ -19,7 +22,7 @@ PAGES = {
     "people": {
         "title": "People",
         "rows": [
-            {"Name": "Alex", "Team": "Sales", "Location": "Auckland"},
+            {"Name": {"value": "Alex", "background": "#bbf7d0"}, "Team": "Sales", "Location": "Auckland"},
             {"Name": "Sam", "Team": "Support", "Location": "Wellington"},
             {"Name": "Jordan", "Team": "Engineering", "Location": "Christchurch"},
         ],
@@ -28,7 +31,11 @@ PAGES = {
         "title": "Projects",
         "rows": [
             {"Project": "Website", "Status": "In progress", "Owner": "Jordan"},
-            {"Project": "Customer survey", "Status": "Complete", "Owner": "Alex"},
+            {
+                "Project": "Customer survey",
+                "Status": {"value": "Complete", "background": "#bbf7d0"},
+                "Owner": {"value": "Alex", "background": "#fecaca"},
+            },
             {"Project": "Help centre", "Status": "Planned", "Owner": "Sam"},
         ],
     },
@@ -83,19 +90,41 @@ def home_page():
     return document("Home", f'<h1>Dictionary browser</h1><p>Choose a page to explore and search its records.</p><div class="cards">{cards}</div>')
 
 
-def table_page(slug, query):
-    page = PAGES[slug]
+def cell_value(cell):
+    """Cells may be plain values or dictionaries with value/background fields."""
+    return str(cell.get("value", "")) if isinstance(cell, dict) else str(cell)
+
+
+def table_fragment(slug, query):
+    # Render a snapshot of the current data on every request.
+    page = deepcopy(PAGES[slug])
     # Collect all keys so records with different fields still display correctly.
     columns = list(dict.fromkeys(key for row in page["rows"] for key in row))
     rows = [row for row in page["rows"]
-            if query.casefold() in " ".join(str(value) for value in row.values()).casefold()]
+            if query.casefold() in " ".join(cell_value(value) for value in row.values()).casefold()]
     headings = "".join(f'<th scope="col">{escape(str(key))}</th>' for key in columns)
+    def cell(row, key):
+        data = row.get(key, "")
+        value = cell_value(data)
+        color = data.get("background", "") if isinstance(data, dict) else ""
+        # Only accept hex colors; never insert arbitrary CSS from data.
+        style = f' style="background-color: {color}"' if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color) else ""
+        return f'<td{style}>{escape(value)}</td>'
+
     body = "".join(
-        "<tr>" + "".join(f'<td>{escape(str(row.get(key, "")))}</td>' for key in columns) + "</tr>"
+        "<tr>" + "".join(cell(row, key) for key in columns) + "</tr>"
         for row in rows
     )
     if not rows:
         body = f'<tr><td colspan="{max(1, len(columns))}">No matching records.</td></tr>'
+    return f"""<table>
+      <caption>{len(rows)} of {len(page['rows'])} records</caption>
+      <thead><tr>{headings}</tr></thead><tbody>{body}</tbody>
+    </table>"""
+
+
+def table_page(slug, query):
+    page = PAGES[slug]
     content = f"""<a href="/">← All pages</a>
     <h1>{escape(page['title'])}</h1>
     <form method="get">
@@ -106,10 +135,9 @@ def table_page(slug, query):
         <a href="/page/{quote(slug, safe='')}">Clear</a>
       </div>
     </form>
-    <div class="table-wrap"><table>
-      <caption>{len(rows)} of {len(page['rows'])} records</caption>
-      <thead><tr>{headings}</tr></thead><tbody>{body}</tbody>
-    </table></div>"""
+    <p id="update-status" role="status">Updates automatically every 2 seconds.</p>
+    <div id="live-table" class="table-wrap" data-endpoint="/api/table/{quote(slug, safe='')}">{table_fragment(slug, query)}</div>
+    <script src="/live.js" defer></script>"""
     return document(page["title"], content)
 
 
@@ -117,8 +145,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         request = urlsplit(self.path)
         status = 200
+        content_type = "text/html; charset=utf-8"
         if request.path == "/":
             html = home_page()
+        elif request.path == "/live.js":
+            html = Path(__file__).with_name("live.js").read_text(encoding="utf-8")
+            content_type = "text/javascript; charset=utf-8"
+        elif request.path.startswith("/api/table/") and request.path[11:] in PAGES:
+            query = parse_qs(request.query).get("q", [""])[0]
+            html = table_fragment(request.path[11:], query)
         elif request.path.startswith("/page/") and request.path[6:] in PAGES:
             query = parse_qs(request.query).get("q", [""])[0]
             html = table_page(request.path[6:], query)
@@ -127,7 +162,8 @@ class Handler(BaseHTTPRequestHandler):
             html = document("Page not found", '<h1>Page not found</h1><a href="/">Return home</a>')
         payload = html.encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
